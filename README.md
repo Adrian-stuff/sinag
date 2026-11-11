@@ -15,4 +15,4 @@ simulator (ESP32 #2) → Modbus RTU → Sinag device (ESP32 #1) → MQTT → Fas
 | `app/` | Flutter app | To build |
 
 Start with `firmware/README.md` for wiring and flashing, and `docs/contracts/` before writing any code.
-Change a contract only after the project lead (Adrian) approves.
+Change a contract only after the project lead approves.
