@@ -24,7 +24,7 @@ meter are independent: a site can have either one or both.
 
 ```json
 {
-  "ts": 1731300000, "voltage_v": 230.1, "current_a": 6.52, "power_w": 1450,
+  "ts": 1731300000, "meter_type": "ansi-c12", "voltage_v": 230.1, "current_a": 6.52, "power_w": 1450,
   "apparent_va": 1526, "reactive_var": 477, "pf": 0.95, "freq_hz": 60.01,
   "import_kwh": 1520.35, "export_kwh": 12.40, "grid_on": true
 }
@@ -34,6 +34,7 @@ meter are independent: a site can have either one or both.
 - `import_kwh` / `export_kwh` are the meter's running totals. The bill is the
   difference between two readings.
 - `grid_on` is derived on the device: `voltage_v > 100`.
+- `meter_type`: `"sdm120"` (customer submeter, Contract A2) or `"ansi-c12"` (Meralco-style utility meter, Contract A3).
 
 ## `sinag/{device_id}/status` — retained, also the MQTT last-will
 

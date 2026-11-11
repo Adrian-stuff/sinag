@@ -57,8 +57,12 @@ check that GND is shared, swap A/B, then swap TX/RX.
 
 ## Using the simulator
 
-The simulator has two modes. **Hold the button for more than 6 s** to switch
-between them (or use the web page). It remembers the mode after a reboot.
+The simulator has three modes: **inverter**, **meter** (an SDM120 customer submeter on
+Modbus) and **MERALCO** (a utility meter like Meralco's Aclara I-210+c, speaking
+ANSI C12.18 with C12.19 tables; see `docs/contracts/A3-meralco-meter-c12.md`).
+**Hold the button for more than 6 s** to go to the next mode (or use the web page).
+It remembers the mode after a reboot. MERALCO mode uses the same knob, button and LCD as
+meter mode. The LCD's link page reads `C12 OK` instead of `MB OK`.
 
 | Control | Inverter mode (slave 1) | Smart meter mode (slave 2) |
 |---|---|---|
@@ -66,7 +70,7 @@ between them (or use the web page). It remembers the mode after a reboot.
 | Tap the button | Next target: SUN → LOAD → SOC → SPEED | Next target: LOAD → SUN → VOLT → SPEED |
 | Hold 1–3 s, release | Toggles **BROWNOUT** (`grid_on=0`, `grid_w=0`) | Toggles **BROWNOUT** (0 V, 0 A, 0 W) |
 | Hold 3–6 s, release | Toggles **FAULT 21** (overheating, temperature climbs to ~78 °C) | Toggles **LOW VOLTAGE** (sag to 195 V) |
-| Hold > 6 s, release | Switches to meter mode | Switches to inverter mode |
+| Hold > 6 s, release | Next mode (→ meter) | Next mode (meter → MERALCO → inverter) |
 
 What each knob target sets: **SUN** = 0–5000 W solar · **LOAD** = 150–4000 W home use ·
 **SOC** = battery 0–100 % · **VOLT** = grid voltage 180–260 V ·

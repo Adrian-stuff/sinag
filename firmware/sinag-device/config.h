@@ -30,6 +30,10 @@
 #define PROFILE           PROFILE_SINAG_SIM     // inverter -> sinag/{id}/telemetry
 #define METER_ENABLED     1
 #define METER_PROFILE     METER_SDM120          // smart meter -> sinag/{id}/meter
+#define METER_ANSI_ENABLED 1                    // utility meter (Meralco/Aclara-style), ANSI C12.18
+#define C12_USER_ID       2
+#define C12_USER          "SINAG"               // up to 10 chars
+#define C12_PASSWORD      ""                    // up to 20 chars; a real utility meter's belongs to the utility
 #define ABSENT_RETRY_MS   15000
 
 // ---- Status LED (on-board LED is GPIO 2 on most ESP32 DevKits)

@@ -60,7 +60,7 @@ footer{margin-top:14px;font-size:12px;color:var(--mute);text-align:center}
 
 <div class="modebar">
   <span class="k">Simulating</span>
-  <div class="seg"><button id="m_inverter">Hybrid inverter</button><button id="m_meter">Smart meter</button></div>
+  <div class="seg"><button id="m_inverter">Hybrid inverter</button><button id="m_meter">Submeter (SDM120)</button><button id="m_meralco">Meralco meter (C12.18)</button></div>
   <span class="sub" id="modeSub" style="margin:0"></span>
 </div>
 
@@ -88,7 +88,7 @@ footer{margin-top:14px;font-size:12px;color:var(--mute);text-align:center}
     <div class="hint" id="panelHint"></div>
   </div>
   <div class="card">
-    <h2>Modbus registers · slave <span id="sid">1</span></h2>
+    <h2 id="regTitle">Modbus registers</h2>
     <div class="sub" id="mapSub" style="margin:-6px 0 6px"></div>
     <table><thead><tr><th>Reg</th><th>Field</th><th class="n">Value</th><th class="n">Raw</th></tr></thead><tbody id="regs"></tbody></table>
   </div>
@@ -119,10 +119,10 @@ function tile(i,k,v,unit,sub,pct,color){$("t"+i+"k").textContent=k;$("t"+i+"v").
   $("t"+i+"s").textContent=sub;const b=$("t"+i+"b");b.style.width=Math.max(0,Math.min(100,pct))+"%";b.style.background=color}
 function setSlider(id,val,label){if(!drag[id])$(id).value=val;$(id+"O").textContent=label}
 function render(s){
-  S=s;const c=s.ctl,m=s.mb,meter=s.mode=="meter";
-  $("title").textContent=meter?"Smart Meter Simulator":"Inverter Simulator";document.title="Sinag "+(meter?"Meter":"Inverter")+" Sim";
-  $("m_inverter").className=meter?"":"on";$("m_meter").className=meter?"on":"";
-  $("modeSub").textContent=meter?"SDM120-style kWh meter · slave "+m.slave_id+" · float32 registers":"Hybrid solar inverter · slave "+m.slave_id+" · Contract A map";
+  S=s;const c=s.ctl,m=s.mb,meter=s.mode!="inverter",ansi=s.mode=="meralco";
+  $("title").textContent=ansi?"Meralco Smart Meter Simulator":meter?"Submeter Simulator":"Inverter Simulator";document.title="Sinag "+(ansi?"Meralco":meter?"Meter":"Inverter")+" Sim";
+  ["inverter","meter","meralco"].forEach(k=>$("m_"+k).className=s.mode==k?"on":"");
+  $("modeSub").textContent=ansi?"Aclara I-210+c-style utility meter · ANSI C12.18 packets · C12.19 tables":meter?"SDM120-style customer submeter · Modbus slave "+m.slave_id+" · float32 registers":"Hybrid solar inverter · Modbus slave "+m.slave_id+" · Contract A map";
   if(meter){const e=s.meter;
     tile(0,"Voltage",fmt(e.v,1),"V",e.hz.toFixed(2)+" Hz",e.v/2.6,e.v<200&&e.v>0?"var(--warn)":"var(--grid)");
     tile(1,"Net power",sgn(e.p),"W",(e.p>0.5?"Importing":e.p<-0.5?"Exporting":"Idle")+" · PF "+e.pf.toFixed(2),Math.abs(e.p)/50,e.p<0?"var(--ok)":"var(--acc)");
@@ -146,17 +146,18 @@ function render(s){
   $("bFault").textContent=(meter?"Low voltage":"Fault 21")+(evOn?" ON":"");
   $("bSet").textContent=meter?"Set reading…":"Set SoC…";
   if(document.activeElement!==$("speed"))$("speed").value=c.speed;
-  $("panelHint").textContent="Physical panel: tap = next knob target ("+c.knobs.map(k=>KNOB_LABEL[k]).join(" → ")+") · hold 1–3 s = Brownout · hold 3–6 s = "+(meter?"Low voltage":"Fault")+" · hold >6 s = switch mode.";
+  $("panelHint").textContent="Physical panel: tap = next knob target ("+c.knobs.map(k=>KNOB_LABEL[k]).join(" → ")+") · hold 1–3 s = Brownout · hold 3–6 s = "+(meter?"Low voltage":"Fault")+" · hold >6 s = next mode.";
   pill("pLink",m.linked?"Modbus: polled":"Modbus: "+(m.never?"waiting":"no polls"),m.linked?"ok":m.never?"":"bad");
   pill("pGrid",c.brownout?"Grid: BROWNOUT":"Grid: ON",c.brownout?"warn":"ok");
   if(meter)pill("pFault",c.sag?"Voltage: LOW":"Voltage: normal",c.sag?"warn":"ok");
   else pill("pFault",c.fault?"Fault: 21":"Fault: none",c.fault?"bad":"ok");
-  $("sid").textContent=m.slave_id;$("mapSub").textContent=meter?"Function 04 · float32, high word first":"Function 03 · int16 / uint16";
+  $("regTitle").textContent=ansi?"C12.19 tables":"Modbus registers · slave "+m.slave_id;
+  $("mapSub").textContent=ansi?"Read after logon · little-endian · Wh, V×100, A×1000":meter?"Function 04 · float32, high word first":"Function 03 · int16 / uint16";
   $("regs").innerHTML=s.table.map(r=>`<tr><td class="reg">${r[0]}</td><td>${r[1]}</td><td class="n">${r[2]}</td><td class="raw">${r[3]}</td></tr>`).join("");
   $("mReq").textContent=m.requests;$("mCrc").textContent=m.crc_errors;$("mExc").textContent=m.exceptions;
   $("mAge").textContent=m.never?"never":m.last_age_s+" s ago";$("mRx").textContent=m.last_rx||"—";$("mTx").textContent=m.last_tx||"—";
   $("mHint").textContent=m.never?(m.crc_errors?"Bytes arrive but CRC fails — check baud (9600) and GND.":"No requests yet — check TX↔RX are crossed and GND is shared."+(m.rs485?" With RS485, try swapping A/B.":"")):
-    (m.linked?"Sinag device is reading slave "+m.slave_id+(m.rs485?" over RS485.":" over direct UART."):"Polls stopped — is the Sinag device running?");
+    (m.linked?"Sinag device is reading "+(ansi?"the C12.19 tables":"slave "+m.slave_id)+(m.rs485?" over RS485.":" over direct UART."):"Polls stopped — is the Sinag device running?");
   const sys=s.sys;$("foot").textContent=`fw ${sys.fw} · ${sys.ap?"AP mode":"Wi-Fi "+sys.rssi+" dBm"} · ${sys.ip} · up ${Math.floor(sys.uptime_s/60)} min · ${m.baud} 8N1`;
 }
 async function poll(){try{const r=await fetch("/api/state",{cache:"no-store"});render(await r.json());pill("pWeb","Web: live","ok")}catch(e){pill("pWeb","Web: offline","bad")}}
@@ -166,7 +167,7 @@ function send(p){return fetch("/api/control",{method:"POST",body:new URLSearchPa
   el.addEventListener("input",()=>{drag[id]=1;clearTimeout(timers[id]);timers[id]=setTimeout(()=>send({[id]:el.value}),120)});
   el.addEventListener("change",()=>{send({[id]:el.value}).then(()=>drag[id]=0)});
 });
-$("m_inverter").onclick=()=>send({mode:"inverter"});$("m_meter").onclick=()=>send({mode:"meter"});
+["inverter","meter","meralco"].forEach(k=>$("m_"+k).onclick=()=>send({mode:k}));
 $("bBrown").onclick=()=>S&&send({brownout:S.ctl.brownout?0:1});
 $("bFault").onclick=()=>S&&(S.mode=="meter"?send({sag:S.ctl.sag?0:1}):send({fault:S.ctl.fault?0:1}));
 $("speed").onchange=e=>send({speed:e.target.value});

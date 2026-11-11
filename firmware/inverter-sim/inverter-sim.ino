@@ -1,9 +1,11 @@
 // =============================================================================
-//  Sinag — Simulator (ESP32 #2). Two personalities, one box:
+//  Sinag — Simulator (ESP32 #2). Three personalities, one box:
 //
 //    INVERTER mode  Hybrid solar inverter, Modbus RTU slave ID 1, Contract A map
-//    METER mode     Smart kWh meter (Eastron SDM120-style), slave ID 2,
+//    METER mode     Customer submeter (Eastron SDM120-style), Modbus slave ID 2,
 //                   float32 registers: V, A, W, VA, VAr, PF, Hz, import/export kWh
+//    MERALCO mode   Utility smart meter like Meralco's Aclara I-210+c: ANSI C12.18
+//                   packets carrying C12.19 tables (ST-0, ST-1, ST-23, ST-28)
 //
 //  Front panel (1 knob, 1 button, LCD)
 //    Knob ........ sets the selected target
@@ -12,7 +14,7 @@
 //    Tap ......... next knob target
 //    Hold 1–3 s .. toggle BROWNOUT
 //    Hold 3–6 s .. inverter: toggle FAULT 21 · meter: toggle LOW VOLTAGE
-//    Hold > 6 s .. switch INVERTER <-> METER mode (remembered after reboot)
+//    Hold > 6 s .. next mode: INVERTER -> METER -> MERALCO (remembered after reboot)
 //
 //  LCD row 1 = what the knob controls. Row 2 cycles every 2.5 s through all the
 //  readings; an active alert (brownout, fault, low voltage) shows every other slot.
@@ -30,13 +32,14 @@
 #include "config.h"
 #include "web_page.h"
 
-#define FW_VERSION      "0.2.0"
+#define FW_VERSION      "0.3.0"
 #define NUM_REGS        8          // inverter map: 0..7
 #define METER_NUM_REGS  0x15A      // meter map: up to total kWh at 0x0156
 
 // ----------------------------------------------------------------- modes ----
-enum Mode : uint8_t { MODE_INVERTER, MODE_METER };
-static const char *const MODE_IDS[] = { "inverter", "meter" };
+enum Mode : uint8_t { MODE_INVERTER, MODE_METER, MODE_METER_ANSI, NUM_MODES };
+static const char *const MODE_IDS[NUM_MODES] = { "inverter", "meter", "meralco" };
+static const char *const MODE_LCD[NUM_MODES] = { "INVERTER", "SUBMETER", "MERALCO" };
 
 enum Knob : uint8_t { KNOB_SUN, KNOB_LOAD, KNOB_SOC, KNOB_SPEED, KNOB_VOLT, KNOB_COUNT };
 static const char *const KNOB_IDS[KNOB_COUNT]   = { "sun", "load", "soc", "speed", "volt" };
@@ -101,7 +104,8 @@ int      lastAppliedPot = -1;    // knob only writes when it moves (so SOC can s
 
 Preferences prefs;
 
-static bool isMeter() { return S.mode == MODE_METER; }
+static bool isMeter() { return S.mode != MODE_INVERTER; }   // both meter modes share physics, knobs, LCD
+static bool isAnsi()  { return S.mode == MODE_METER_ANSI; }
 static const Knob *modeKnobs() { return isMeter() ? KNOBS_MTR : KNOBS_INV; }
 static int knobIndex(Knob k) {
   for (int i = 0; i < KNOBS_PER_MODE; i++) if (modeKnobs()[i] == k) return i;
@@ -122,7 +126,7 @@ uint8_t  rxBuf[64];
 size_t   rxLen = 0;
 uint32_t lastByteMs = 0;
 
-static uint8_t  activeSlaveId() { return isMeter() ? METER_SLAVE_ID : MB_SLAVE_ID; }
+static uint8_t  activeSlaveId() { return isAnsi() ? 0 : isMeter() ? METER_SLAVE_ID : MB_SLAVE_ID; }   // 0 = C12.18, no slave id
 static uint16_t activeRegCount() { return isMeter() ? METER_NUM_REGS : NUM_REGS; }
 static uint16_t activeReg(uint16_t a) { return isMeter() ? mregs[a] : regs[a]; }
 
@@ -160,6 +164,7 @@ static void mbException(uint8_t fc, uint8_t code) {
 
 static void mbHandleFrame(const uint8_t *f, size_t n) {
   if (n < 4) return;
+  if (f[0] == 0xEE) return;                     // a C12.18 packet, not Modbus: ignore quietly
   uint16_t crc = crc16(f, n - 2);
   if ((f[n - 2] | (f[n - 1] << 8)) != crc) { mb.crcErrors++; return; }
   if (f[0] != activeSlaveId()) { mb.otherId++; return; }   // not for us (or broadcast)
@@ -216,6 +221,159 @@ static void mbPoll() {
     rxLen = 0;
   }
 }
+
+// ------------------------------------------- ANSI C12.18 (MERALCO mode) ----
+// Behaves like a utility meter such as Meralco's Aclara I-210+c on its data port:
+// C12.18 packets (STP 0xEE, ctrl, length, data, CRC) with ACK/NAK, carrying
+// C12.19 tables. Table layouts are a FIXED, SIMPLIFIED subset — see
+// docs/contracts/A3-meralco-meter-c12.md. A real meter describes its own layout
+// in ST-0/ST-21/ST-12/ST-15 and requires the utility's password.
+#define C12_STP 0xEE
+#define C12_ACK 0x06
+#define C12_NAK 0x15
+enum : uint8_t { C12_OK = 0x00, C12_ERR = 0x01, C12_SNS = 0x02, C12_ISC = 0x03, C12_ONP = 0x04, C12_IAR = 0x05 };
+
+uint8_t  c12Buf[96];
+size_t   c12Len = 0;
+uint32_t c12LastMs = 0;
+uint8_t  c12Ctrl = 0;
+bool     c12LoggedOn = false;
+
+// CRC-16/X-25 (CCITT, reflected, init 0xFFFF, inverted), sent low byte first.
+// Verify against the C12.18 spec before talking to a real meter.
+static uint16_t c12Crc(const uint8_t *d, size_t n) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < n; i++) {
+    crc ^= d[i];
+    for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+  }
+  return ~crc;
+}
+
+static void c12Write(const uint8_t *d, size_t n) {
+  if (RS485_DE_PIN >= 0) digitalWrite(RS485_DE_PIN, HIGH);
+  MB.write(d, n);
+  MB.flush();
+  if (RS485_DE_PIN >= 0) digitalWrite(RS485_DE_PIN, LOW);
+}
+
+static void c12SendPacket(const uint8_t *data, uint16_t len) {
+  static uint8_t pkt[6 + 128 + 2];
+  if (len > 128) len = 128;
+  pkt[0] = C12_STP; pkt[1] = 0x00; pkt[2] = c12Ctrl; pkt[3] = 0x00;
+  pkt[4] = len >> 8; pkt[5] = len & 0xFF;
+  memcpy(pkt + 6, data, len);
+  uint16_t crc = c12Crc(pkt, 6 + len);
+  pkt[6 + len] = crc & 0xFF;
+  pkt[7 + len] = crc >> 8;
+  toHex(mb.lastTx, sizeof mb.lastTx, pkt, 8 + len);
+  c12Write(pkt, 8 + len);
+}
+
+// Table data is little-endian (ST-0 DATA_ORDER = 0).
+static void le32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void le16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
+
+// Builds one table into t; returns its length, 0 if the table doesn't exist.
+static size_t c12Table(uint16_t id, uint8_t *t) {
+  switch (id) {
+    case 0: {   // ST-0 GEN_CONFIG (first fields only): format control, device class, nameplate type
+      const uint8_t st0[] = { 0x02, 0x00, 0x00, 'A', 'C', 'L', ' ', 0x02, 0x00, 0x00 };
+      memcpy(t, st0, sizeof st0);
+      return sizeof st0;
+    }
+    case 1: {   // ST-1 MANUFACTURER_IDENT
+      memcpy(t, "ACL ", 4);                    // MANUFACTURER
+      memcpy(t + 4, "I210+c  ", 8);            // ED_MODEL
+      t[12] = 1; t[13] = 0; t[14] = 2; t[15] = 0;   // HW ver/rev, FW ver/rev
+      memcpy(t + 16, "SINAG-SIM-000001", 16);  // MFG_SERIAL_NUMBER
+      return 32;
+    }
+    case 23: {  // ST-23 CURRENT_REG_DATA: demand resets + summations in Wh
+      t[0] = 0;
+      uint32_t imp = (uint32_t)llround(S.impKwh * 1000.0), exp = (uint32_t)llround(S.expKwh * 1000.0);
+      le32(t + 1, imp);
+      le32(t + 5, exp);
+      le32(t + 9, imp + exp);
+      return 13;
+    }
+    case 28: {  // ST-28 PRESENT_REGISTER_DATA: present values
+      le32(t + 0,  (uint32_t)(int32_t)lroundf(S.mP));       // W, signed (+ delivered / - received)
+      le32(t + 4,  (uint32_t)lroundf(S.mV * 100));          // V x100
+      le32(t + 8,  (uint32_t)lroundf(S.mI * 1000));         // A x1000
+      le32(t + 12, (uint32_t)(int32_t)lroundf(S.mVA));      // VA
+      le32(t + 16, (uint32_t)(int32_t)lroundf(S.mP >= 0 ? S.mVAR : -S.mVAR));   // VAr
+      le16(t + 20, (uint16_t)(int16_t)lroundf(S.mPF * 1000)); // PF x1000
+      le16(t + 22, (uint16_t)lroundf(S.mHz * 100));         // Hz x100
+      return 24;
+    }
+    default: return 0;
+  }
+}
+
+static void c12Handle(const uint8_t *d, uint16_t n) {
+  mb.requests++;
+  mb.lastReqMs = millis();
+  uint8_t out[128];
+  size_t o = 0;
+  switch (n ? d[0] : 0xFF) {
+    case 0x20:  // identification: OK, std 0 (C12.18), ver 2, rev 0, end of feature list
+      out[o++] = C12_OK; out[o++] = 0x00; out[o++] = 0x02; out[o++] = 0x00; out[o++] = 0x00; break;
+    case 0x50: c12LoggedOn = true;  out[o++] = C12_OK; break;   // logon (user id + user)
+    case 0x51:                      out[o++] = C12_OK; break;   // security (password): sim accepts any
+    case 0x52: case 0x21: c12LoggedOn = false; out[o++] = C12_OK; break;   // logoff / terminate
+    case 0x70:                      out[o++] = C12_OK; break;   // wait
+    case 0x30: case 0x3F: {         // full / partial (offset) table read
+      if (!c12LoggedOn)               { out[o++] = C12_ISC; break; }
+      if (n < (d[0] == 0x30 ? 3 : 8)) { out[o++] = C12_ERR; break; }
+      uint8_t t[64];
+      size_t len = c12Table((d[1] << 8) | d[2], t), off = 0, cnt = len;
+      if (!len)                       { out[o++] = C12_ONP; break; }
+      if (d[0] == 0x3F) {
+        off = ((uint32_t)d[3] << 16) | (d[4] << 8) | d[5];
+        cnt = (d[6] << 8) | d[7];
+        if (off + cnt > len)          { out[o++] = C12_IAR; break; }
+      }
+      out[o++] = C12_OK; out[o++] = cnt >> 8; out[o++] = cnt & 0xFF;
+      uint8_t sum = 0;
+      for (size_t i = 0; i < cnt; i++) { out[o++] = t[off + i]; sum += t[off + i]; }
+      out[o++] = (uint8_t)(-sum);     // table checksum: two's complement of the byte sum
+      break;
+    }
+    default: out[o++] = C12_SNS;      // service not supported
+  }
+  c12SendPacket(out, o);
+}
+
+static void c12Poll() {
+  while (MB.available()) {
+    uint8_t b = (uint8_t)MB.read();
+    if (c12Len == 0 && b != C12_STP) continue;           // client ACK/NAK, or Modbus polls: not for us
+    if (c12Len >= sizeof c12Buf) c12Len = 0;
+    c12Buf[c12Len++] = b;
+    c12LastMs = millis();
+    if (c12Len < 6) continue;
+    uint16_t len = (c12Buf[4] << 8) | c12Buf[5];
+    if (len > sizeof c12Buf - 8) { c12Len = 0; continue; }
+    if (c12Len < 8u + len) continue;
+    toHex(mb.lastRx, sizeof mb.lastRx, c12Buf, c12Len);
+    uint16_t crc = c12Crc(c12Buf, 6 + len);
+    if ((c12Buf[6 + len] | (c12Buf[7 + len] << 8)) == crc) {
+      const uint8_t ack = C12_ACK;
+      c12Write(&ack, 1);
+      c12Ctrl = c12Buf[2] & 0x20;                          // echo the toggle bit
+      c12Handle(c12Buf + 6, len);
+    } else {
+      mb.crcErrors++;
+      const uint8_t nak = C12_NAK;
+      c12Write(&nak, 1);
+    }
+    c12Len = 0;
+  }
+  if (c12Len && millis() - c12LastMs > 200) c12Len = 0;   // half a packet then silence: drop it
+}
+
+static void commPoll() { if (isAnsi()) c12Poll(); else mbPoll(); }
 
 // -------------------------------------------------------------- physics ----
 static int knobLoadW() { return LOAD_MIN_W + (long)S.loadPct * (LOAD_MAX_W - LOAD_MIN_W) / 100; }
@@ -367,12 +525,14 @@ static void setMode(Mode m) {
   S.mode = m;
   if (knobIndex(knob) < 0) knob = modeKnobs()[0];
   lockKnob();
-  rxLen = 0;
+  rxLen = 0; c12Len = 0; c12LoggedOn = false;
   prefs.putUChar("mode", m);
-  char b[21];
-  snprintf(b, sizeof b, "Modbus ID %d", activeSlaveId());
-  flash(isMeter() ? "MODE: METER" : "MODE: INVERTER", b, 2500);
-  Serial.printf("[mode] %s, slave id %d\n", MODE_IDS[m], activeSlaveId());
+  char a[21], b[21];
+  snprintf(a, sizeof a, "MODE: %s", MODE_LCD[m]);
+  if (isAnsi()) snprintf(b, sizeof b, "ANSI C12.18");
+  else          snprintf(b, sizeof b, "Modbus ID %d", activeSlaveId());
+  flash(a, b, 2500);
+  Serial.printf("[mode] %s, %s\n", MODE_IDS[m], b);
   simTick(0);
 }
 
@@ -387,7 +547,7 @@ static void readButton() {
   btnStable = down;
   if (down) { btnPressedMs = now; return; }
   uint32_t held = now - btnPressedMs;
-  if (held >= MODE_PRESS_MS)            setMode(isMeter() ? MODE_INVERTER : MODE_METER);
+  if (held >= MODE_PRESS_MS)            setMode((Mode)((S.mode + 1) % NUM_MODES));
   else if (held >= VERY_LONG_PRESS_MS)  { if (isMeter()) setSag(!S.sag); else setFault(!S.fault); }
   else if (held >= LONG_PRESS_MS)       setBrownout(!S.brownout);
   else                                  setKnob(modeKnobs()[(knobIndex(knob) + 1) % KNOBS_PER_MODE]);
@@ -443,9 +603,9 @@ static void pageText(Page pg, char *out, size_t n) {
     case PG_BATT:  snprintf(out, n, "BAT%4d%%%+6dW", (int)lroundf(S.soc), S.battW); break;
     case PG_TEMP:  snprintf(out, n, "TEMP %2dC %s", (int)lroundf(S.temp), S.fault ? "FAULT21" : "OK"); break;
     case PG_LINK:
-      if (!mb.lastReqMs)       snprintf(out, n, "MB no polls yet");
-      else if (modbusLinked()) snprintf(out, n, "MB OK %6lu rq", (unsigned long)mb.requests);
-      else                     snprintf(out, n, "MB LOST %4lus", (unsigned long)((millis() - mb.lastReqMs) / 1000));
+      if (!mb.lastReqMs)       snprintf(out, n, "%s no polls yet", isAnsi() ? "C12" : "MB");
+      else if (modbusLinked()) snprintf(out, n, "%s OK %6lu rq", isAnsi() ? "C12" : "MB", (unsigned long)mb.requests);
+      else                     snprintf(out, n, "%s LOST %4lus", isAnsi() ? "C12" : "MB", (unsigned long)((millis() - mb.lastReqMs) / 1000));
       break;
     case PG_IP: {
       bool ap = WiFi.getMode() == WIFI_AP;
@@ -483,7 +643,7 @@ static void drawLcd() {
   if (btnStable && now - btnPressedMs >= LONG_PRESS_MS) {       // hold hint
     uint32_t held = now - btnPressedMs;
     snprintf(a, sizeof a, "Release to");
-    if (held >= MODE_PRESS_MS)           snprintf(b, sizeof b, "MODE: %s", isMeter() ? "INVERTER" : "METER");
+    if (held >= MODE_PRESS_MS)           snprintf(b, sizeof b, "MODE: %s", MODE_LCD[(S.mode + 1) % NUM_MODES]);
     else if (held >= VERY_LONG_PRESS_MS) snprintf(b, sizeof b, isMeter() ? "LOW VOLT %s" : "FAULT %s",
                                                   (isMeter() ? S.sag : S.fault) ? "OFF" : "ON");
     else                                 snprintf(b, sizeof b, "BROWNOUT %s", S.brownout ? "OFF" : "ON");
@@ -529,7 +689,20 @@ static void sendState() {
 
   // register table of the active map, exactly as the Sinag device reads it
   jcat("\"table\":[");
-  if (m) {
+  if (isAnsi()) {
+    uint8_t t[64];
+    size_t n1 = c12Table(1, t);
+    jcat("[\"ST-1\",\"manufacturer / model\",\"%.4s / %.8s\",\"%u bytes\"],", t, t + 4, (unsigned)n1);
+    c12Table(23, t);
+    jcat("[\"ST-23\",\"kWh delivered (import)\",\"%.2f kWh\",\"%02X %02X %02X %02X\"],", S.impKwh, t[1], t[2], t[3], t[4]);
+    jcat("[\"ST-23\",\"kWh received (export)\",\"%.2f kWh\",\"%02X %02X %02X %02X\"],", S.expKwh, t[5], t[6], t[7], t[8]);
+    c12Table(28, t);
+    jcat("[\"ST-28\",\"watts\",\"%.0f W\",\"%02X %02X %02X %02X\"],", S.mP, t[0], t[1], t[2], t[3]);
+    jcat("[\"ST-28\",\"volts\",\"%.1f V\",\"%02X %02X %02X %02X\"],", S.mV, t[4], t[5], t[6], t[7]);
+    jcat("[\"ST-28\",\"amps\",\"%.2f A\",\"%02X %02X %02X %02X\"],", S.mI, t[8], t[9], t[10], t[11]);
+    jcat("[\"ST-28\",\"power factor\",\"%.2f\",\"%02X %02X\"],", S.mPF, t[20], t[21]);
+    jcat("[\"ST-28\",\"frequency\",\"%.2f Hz\",\"%02X %02X\"]", S.mHz, t[22], t[23]);
+  } else if (m) {
     for (size_t i = 0; i < sizeof METER_MAP / sizeof METER_MAP[0]; i++) {
       const MeterReg &r = METER_MAP[i];
       jcat("%s[\"0x%04X\",\"%s\",\"%.*f %s\",\"%04X %04X\"]", i ? "," : "", r.addr, r.name, r.dec,
@@ -551,11 +724,11 @@ static void sendState() {
 
   uint32_t age = mb.lastReqMs ? (millis() - mb.lastReqMs) / 1000 : 0;
   jcat("\"mb\":{\"linked\":%s,\"requests\":%lu,\"crc_errors\":%lu,\"other_id\":%lu,\"exceptions\":%lu,"
-       "\"last_age_s\":%lu,\"never\":%s,\"last_rx\":\"%s\",\"last_tx\":\"%s\",\"slave_id\":%d,\"baud\":%d,\"rs485\":%s},",
+       "\"last_age_s\":%lu,\"never\":%s,\"last_rx\":\"%s\",\"last_tx\":\"%s\",\"slave_id\":%d,\"baud\":%d,\"rs485\":%s,\"protocol\":\"%s\"},",
        modbusLinked() ? "true" : "false", (unsigned long)mb.requests, (unsigned long)mb.crcErrors,
        (unsigned long)mb.otherId, (unsigned long)mb.exceptions, (unsigned long)age,
        mb.lastReqMs ? "false" : "true", mb.lastRx, mb.lastTx, activeSlaveId(), MB_BAUD,
-       RS485_DE_PIN >= 0 ? "true" : "false");
+       RS485_DE_PIN >= 0 ? "true" : "false", isAnsi() ? "ansi-c12.18" : "modbus-rtu");
 
   bool ap = WiFi.getMode() == WIFI_AP;
   jcat("\"sys\":{\"fw\":\"%s\",\"uptime_s\":%lu,\"rssi\":%d,\"ip\":\"%s\",\"ap\":%s}}",
@@ -567,7 +740,9 @@ static void sendState() {
 }
 
 static void handleControl() {
-  if (web.hasArg("mode")) setMode(web.arg("mode") == "meter" ? MODE_METER : MODE_INVERTER);
+  if (web.hasArg("mode"))
+    for (uint8_t m = 0; m < NUM_MODES; m++)
+      if (web.arg("mode") == MODE_IDS[m]) setMode((Mode)m);
   if (web.hasArg("knob"))
     for (uint8_t k = 0; k < KNOB_COUNT; k++)
       if (web.arg("knob") == KNOB_IDS[k] && knobIndex((Knob)k) >= 0) setKnob((Knob)k);
@@ -624,7 +799,8 @@ void setup() {
   Serial.println("\n=== Sinag simulator " FW_VERSION " ===");
 
   prefs.begin("sinag-sim", false);
-  S.mode   = prefs.getUChar("mode", MODE_INVERTER) == MODE_METER ? MODE_METER : MODE_INVERTER;
+  uint8_t savedMode = prefs.getUChar("mode", MODE_INVERTER);
+  S.mode   = savedMode < NUM_MODES ? (Mode)savedMode : MODE_INVERTER;
   S.impKwh = prefs.getDouble("imp", METER_START_KWH);
   S.expKwh = prefs.getDouble("exp", 0.0);
   knob     = modeKnobs()[0];
@@ -635,7 +811,7 @@ void setup() {
 
   if (RS485_DE_PIN >= 0) { pinMode(RS485_DE_PIN, OUTPUT); digitalWrite(RS485_DE_PIN, LOW); }
   MB.begin(MB_BAUD, SERIAL_8N1, MB_RX_PIN, MB_TX_PIN);
-  Serial.printf("[mode] %s -> Modbus slave id %d, %d 8N1, RX=%d TX=%d, %s\n", MODE_IDS[S.mode], activeSlaveId(),
+  Serial.printf("[mode] %s -> %s id %d, %d 8N1, RX=%d TX=%d, %s\n", MODE_IDS[S.mode], isAnsi() ? "ANSI C12.18" : "Modbus slave", activeSlaveId(),
                 MB_BAUD, MB_RX_PIN, MB_TX_PIN, RS485_DE_PIN >= 0 ? "RS485 transceiver" : "direct UART (no RS485)");
 
   Wire.begin(LCD_SDA, LCD_SCL);
@@ -648,7 +824,7 @@ void setup() {
   } else {
     Serial.println("[lcd] not found on I2C — check SDA/SCL/power (running without it)");
   }
-  flash(isMeter() ? "Sinag Meter Sim" : "Sinag Inverter", "Simulator " FW_VERSION, 2000);
+  flash(isAnsi() ? "Sinag C12 Meter" : isMeter() ? "Sinag Meter Sim" : "Sinag Inverter", "Simulator " FW_VERSION, 2000);
 
   for (int i = 0; i < 8; i++) readPot();
   lockKnob();                                   // don't let the knob jump the defaults at boot
@@ -677,13 +853,13 @@ void loop() {
   static uint32_t tPot = 0, tSim = 0, tLcd = 0, tLog = 0, tSave = 0;
   uint32_t now = millis();
 
-  mbPoll();                                     // keep this first and frequent
+  commPoll();                                   // keep this first and frequent
   readButton();
   if (now - tPot >= 20)  { tPot = now; readPot(); }
   if (now - tSim >= 250) { tSim = now; simTick(0.25f); }
-  mbPoll();
+  commPoll();
   if (now - tLcd >= 200) { tLcd = now; drawLcd(); }
-  mbPoll();
+  commPoll();
   wifiLoop();
   web.handleClient();
 

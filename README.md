@@ -8,9 +8,9 @@ simulator (ESP32 #2) → Modbus RTU → Sinag device (ESP32 #1) → MQTT → Fas
 
 | Folder | What | Status |
 |---|---|---|
-| `firmware/inverter-sim/` | ESP32 simulator: hybrid inverter or SDM120 smart meter, LCD, knob, button, web dashboard | Done |
-| `firmware/sinag-device/` | ESP32 connector: Modbus master → MQTT | Done |
-| `docs/contracts/` | A: Modbus map · A2: smart meter map · B: MQTT · C: REST/WS API | C draft, A2/B meter topic proposed |
+| `firmware/inverter-sim/` | ESP32 simulator: hybrid inverter, SDM120 submeter, or Meralco-style ANSI C12.18 meter, LCD, knob, button, web dashboard | Done |
+| `firmware/sinag-device/` | ESP32 connector: Modbus + ANSI C12.18 master → MQTT | Done |
+| `docs/contracts/` | A: Modbus map · A2: submeter map · A3: Meralco C12.18 meter · B: MQTT · C: REST/WS API | C draft; A2, A3 and the B meter topic proposed |
 | `server/` | FastAPI backend, AI service | To build |
 | `app/` | Flutter app | To build |
 
