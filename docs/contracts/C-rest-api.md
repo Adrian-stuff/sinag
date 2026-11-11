@@ -148,7 +148,7 @@ Response:
 `source` is `"template"` when the LLM timed out (12 s) and a facts-only answer was used.
 `history` is optional, max the last 6 turns.
 
-**PROPOSED (grounded tool calling, needs Adrian's approval):** three more response fields, and a third `source` value.
+**PROPOSED (grounded tool calling, needs the project lead's approval):** three more response fields, and a third `source` value.
 
 ```json
 {
@@ -175,7 +175,7 @@ Pre-generated after midnight (and on demand if missing). Defaults to yesterday.
 
 ```json
 {
-  "user_name": "Adrian",
+  "user_name": "Juan",
   "device_id": "sinag-001",
   "rate_php_per_kwh": 12.00,
   "export_credit_php_per_kwh": 6.00,
