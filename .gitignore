@@ -1,0 +1,12 @@
+.DS_Store
+build/
+*.bin
+__pycache__/
+.venv/
+*.db
+*.db-*
+.env
+# Flutter
+.dart_tool/
+app/build/
+.flutter-plugins*
